@@ -1,19 +1,33 @@
 use crate::debugger_command::DebuggerCommand;
-use crate::inferior::Inferior;
+use crate::dwarf_data::{DwarfData, Error as DwarfError};
+use crate::inferior::{Inferior, Status};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
 pub struct Debugger {
     target: String,
+    debug_data: DwarfData,
     history_path: String,
     readline: Editor<()>,
     inferior: Option<Inferior>,
+    breakpoints: Vec<usize>,
 }
 
 impl Debugger {
     /// Initializes the debugger.
     pub fn new(target: &str) -> Debugger {
-        // TODO (milestone 3): initialize the DwarfData
+        let debug_data = match DwarfData::from_file(target) {
+            Ok(val) => val,
+            Err(DwarfError::ErrorOpeningFile) => {
+                println!("Could not open file {}", target);
+                std::process::exit(1);
+            }
+            Err(DwarfError::DwarfFormatError(err)) => {
+                println!("Could not debugging symbols from {}: {:?}", target, err);
+                std::process::exit(1);
+            }
+        };
+        debug_data.print();
 
         let history_path = format!("{}/.deet_history", std::env::var("HOME").unwrap());
         let mut readline = Editor::<()>::new();
@@ -22,31 +36,115 @@ impl Debugger {
 
         Debugger {
             target: target.to_string(),
+            debug_data,
             history_path,
             readline,
             inferior: None,
+            breakpoints: Vec::new(),
         }
+    }
+
+    fn kill(&mut self) {
+        if let Some(inferior) = self.inferior.take() {
+            inferior.kill();
+        }
+    }
+
+    fn cont(&mut self) {
+        match &mut self.inferior {
+            Some(inferior) => match inferior.cont(&self.breakpoints) {
+                Ok(status) => match status {
+                    Status::Stopped(signal, rip) => {
+                        println!("Child stopped (signal {signal})");
+                        println!(
+                            "Stopped at {}",
+                            self.debug_data.get_line_from_addr(rip - 1).unwrap()
+                        );
+                    }
+                    Status::Exited(status) => {
+                        println!("Child exited (status {status})");
+                        self.inferior = None;
+                    }
+                    Status::Signaled(_) => todo!(),
+                },
+                Err(_) => {
+                    println!("Command aborted.");
+                    return;
+                }
+            },
+            None => println!("The program is not being run."),
+        }
+    }
+
+    fn set_breakpoint(&mut self, addr: usize) {
+        println!("Set breakpoint {} at 0x{addr:x}", self.breakpoints.len());
+        self.breakpoints.push(addr);
     }
 
     pub fn run(&mut self) {
         loop {
             match self.get_next_command() {
                 DebuggerCommand::Run(args) => {
+                    // Kill any existing inferiors before starting new ones
+                    self.kill();
+
+                    // Create the inferior
                     if let Some(inferior) = Inferior::new(&self.target, &args) {
-                        // Create the inferior
                         self.inferior = Some(inferior);
-                        // TODO (milestone 1): make the inferior run
-                        // You may use self.inferior.as_mut().unwrap() to get a mutable reference
-                        // to the Inferior object
+                        self.cont();
                     } else {
                         println!("Error starting subprocess");
                     }
                 }
+                DebuggerCommand::Continue => self.cont(),
+                DebuggerCommand::Backtrace => match &self.inferior {
+                    Some(inferior) => inferior.print_backtrace(&self.debug_data).unwrap(),
+                    None => println!("The program is not being run."),
+                },
+                DebuggerCommand::Break(arg) => match arg {
+                    Some(arg) => {
+                        if arg.as_bytes()[0] == b'*' {
+                            let addr = Self::parse_address(&arg[1..]);
+                            match addr {
+                                Some(addr) => self.set_breakpoint(addr),
+                                None => println!("Invalid hex number \"{}\"", &arg[1..]),
+                            }
+                        } else {
+                            if let Ok(line_number) = arg.parse::<usize>() {
+                                match self.debug_data.get_addr_for_line(None, line_number) {
+                                    Some(addr) => self.set_breakpoint(addr),
+                                    None => {
+                                        println!(
+                                            "No line {line_number} in file \"{}.c\".",
+                                            self.target
+                                        )
+                                    }
+                                }
+                            } else {
+                                match self.debug_data.get_addr_for_function(None, &arg) {
+                                    Some(addr) => self.set_breakpoint(addr),
+                                    None => println!("Function \"{arg}\" not defined."),
+                                }
+                            }
+                        }
+                    }
+                    None => println!("No default breakpoint address now."),
+                },
                 DebuggerCommand::Quit => {
+                    self.kill();
                     return;
                 }
             }
         }
+    }
+
+    fn parse_address(addr: &str) -> Option<usize> {
+        let addr_without_0x = if addr.to_lowercase().starts_with("0x") {
+            &addr[2..]
+        } else {
+            &addr
+        };
+        usize::from_str_radix(addr_without_0x, 16).ok()
     }
 
     /// This function prompts the user to enter a command, and continues re-prompting until the user

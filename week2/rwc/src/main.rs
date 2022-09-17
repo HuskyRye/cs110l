@@ -1,4 +1,6 @@
 use std::env;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::process;
 
 fn main() {
@@ -8,5 +10,22 @@ fn main() {
         process::exit(1);
     }
     let filename = &args[1];
-    // Your code here :)
+
+    let file = File::open(filename).expect(&format!("Invalid filename: {filename}"));
+    let mut lines: usize = 0;
+    let words: usize = BufReader::new(file)
+        .lines()
+        .map(|line| {
+            lines += 1;
+            line.unwrap()
+                .split_ascii_whitespace()
+                .collect::<Vec<&str>>()
+                .len()
+        })
+        .sum();
+
+    println!(
+        "{lines} {words} {} {filename}",
+        fs::metadata(filename).unwrap().len()
+    );
 }
