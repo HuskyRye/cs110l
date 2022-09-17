@@ -117,7 +117,7 @@ impl Inferior {
         }
 
         // Replace 0xcc with the original byte and rewind %rip.
-        ptrace::cont(pid, None)?;
+        let _ = ptrace::cont(pid, None);
         let result = self.wait(None)?;
         if let Status::Stopped(_, rip) = result {
             for &breakpoint in breakpoints {

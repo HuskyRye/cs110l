@@ -52,26 +52,36 @@ impl Debugger {
 
     fn cont(&mut self) {
         match &mut self.inferior {
-            Some(inferior) => match inferior.cont(&self.breakpoints) {
-                Ok(status) => match status {
-                    Status::Stopped(signal, rip) => {
-                        println!("Child stopped (signal {signal})");
-                        println!(
-                            "Stopped at {}",
-                            self.debug_data.get_line_from_addr(rip - 1).unwrap()
-                        );
+            Some(inferior) => {
+                println!("Continuing.");
+                match inferior.cont(&self.breakpoints) {
+                    Ok(status) => match status {
+                        Status::Stopped(signal, rip) => {
+                            println!("Child stopped (signal {signal})");
+                            if let Some(line) = self.debug_data.get_line_from_addr(rip - 1) {
+                                println!("Stopped at {line}",);
+                            } else {
+                                println!("Stopped at 0x{:x}", rip - 1);
+                            }
+                        }
+                        Status::Exited(status) => {
+                            println!("Child exited (status {status})");
+                            self.inferior = None;
+                        }
+                        Status::Signaled(signal) => {
+                            println!("\nProgram terminated with signal {signal}, Killed.");
+                            println!("The program no longer exists.");
+                            self.inferior = None;
+                        }
+                    },
+                    Err(err) => {
+                        println!();
+                        println!("{err}");
+                        println!("Command aborted.");
+                        return;
                     }
-                    Status::Exited(status) => {
-                        println!("Child exited (status {status})");
-                        self.inferior = None;
-                    }
-                    Status::Signaled(_) => todo!(),
-                },
-                Err(_) => {
-                    println!("Command aborted.");
-                    return;
                 }
-            },
+            }
             None => println!("The program is not being run."),
         }
     }
