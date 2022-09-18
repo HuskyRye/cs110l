@@ -61,6 +61,11 @@ fn get_input_numbers() -> VecDeque<u32> {
     numbers
 }
 
+fn pop_number(numbers: &Mutex<VecDeque<u32>>) -> Option<u32> {
+    let mut numbers = numbers.lock().unwrap();
+    numbers.pop_front()
+}
+
 fn main() {
     let num_threads = num_cpus::get();
     println!("Farm starting on {} CPUs", num_threads);
@@ -75,13 +80,10 @@ fn main() {
     for _ in 0..num_threads {
         let numbers = Arc::clone(&numbers);
         let handle = thread::spawn(move || loop {
-            let mut numbers = numbers.lock().unwrap();
-            if numbers.is_empty() {
-                break;
+            match pop_number(&numbers) {
+                Some(number) => factor_number(number),
+                None => break,
             }
-            let number = numbers.pop_front().unwrap();
-            drop(numbers); // Release the lock before expensive operations.
-            factor_number(number);
         });
         handles.push(handle);
     }
