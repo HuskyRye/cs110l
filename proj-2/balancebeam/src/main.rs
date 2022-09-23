@@ -4,10 +4,14 @@ mod response;
 use std::sync::Arc;
 
 use clap::Parser;
+use http::StatusCode;
 use rand::{Rng, SeedableRng};
+use std::io::ErrorKind;
 use tokio::{
     net::{TcpListener, TcpStream},
     stream::StreamExt,
+    sync::RwLock,
+    time::{self, Duration},
 };
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -57,6 +61,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// Whether the upstream address is dead
+    upstream_dead: RwLock<Vec<bool>>,
 }
 
 #[tokio::main]
@@ -86,34 +92,91 @@ async fn main() {
     };
     log::info!("Listening for requests on {}", options.bind);
 
-    // Handle incoming connections
+    let upstream_dead = vec![false; options.upstream.len()];
     let state = Arc::new(ProxyState {
         upstream_addresses: options.upstream,
+        upstream_dead: RwLock::new(upstream_dead),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
     });
+
+    tokio::spawn(active_health_check(Arc::clone(&state)));
+
+    // Handle incoming connections
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         if let Ok(stream) = stream {
             let state = Arc::clone(&state);
             // Handle the connection!
-            tokio::spawn(async {
-                handle_connection(stream, state).await;
-            });
+            tokio::spawn(handle_connection(stream, state));
+        }
+    }
+}
+
+async fn active_health_check_upstream(
+    state: Arc<ProxyState>,
+    upstream_address: &String,
+) -> Option<()> {
+    let mut stream = TcpStream::connect(upstream_address).await.ok()?;
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(&state.active_health_check_path)
+        .header("Host", upstream_address)
+        .body(Vec::new())
+        .unwrap();
+    request::write_to_stream(&request, &mut stream).await.ok()?;
+
+    let response = response::read_from_stream(&mut stream, request.method())
+        .await
+        .ok()?;
+    if response.status() == StatusCode::OK {
+        Some(())
+    } else {
+        None
+    }
+}
+
+async fn active_health_check(state: Arc<ProxyState>) {
+    let mut interval = time::interval(Duration::from_secs(
+        state.active_health_check_interval as u64,
+    ));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        // health check here
+        for (index, upstream_address) in state.upstream_addresses.iter().enumerate() {
+            state.upstream_dead.write().await[index] =
+                active_health_check_upstream(Arc::clone(&state), upstream_address)
+                    .await
+                    .is_none();
         }
     }
 }
 
 async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).await.or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+    loop {
+        let alive_idxes: Vec<usize> = state
+            .upstream_dead
+            .read()
+            .await
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &dead)| if dead { None } else { Some(index) })
+            .collect();
+        if alive_idxes.is_empty() {
+            return Err(std::io::Error::from(ErrorKind::ConnectionRefused));
+        }
+
+        let random_idx = alive_idxes[rng.gen_range(0, alive_idxes.len())];
+        let upstream_ip = &state.upstream_addresses[random_idx];
+
+        match TcpStream::connect(upstream_ip).await {
+            Ok(stream) => break Ok(stream),
+            Err(_) => state.upstream_dead.write().await[random_idx] = true,
+        }
+    }
 }
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
