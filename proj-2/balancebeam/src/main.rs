@@ -1,7 +1,7 @@
 mod request;
 mod response;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use clap::Parser;
 use http::StatusCode;
@@ -63,6 +63,8 @@ struct ProxyState {
     upstream_addresses: Vec<String>,
     /// Whether the upstream address is dead
     upstream_dead: RwLock<Vec<bool>>,
+    /// The rate limiter tracks counters for each IP
+    requests_counters: RwLock<HashMap<String, usize>>,
 }
 
 #[tokio::main]
@@ -99,9 +101,14 @@ async fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        requests_counters: RwLock::new(HashMap::new()),
     });
 
     tokio::spawn(active_health_check(Arc::clone(&state)));
+
+    if state.max_requests_per_minute != 0 {
+        tokio::spawn(reset_counters(Arc::clone(&state)));
+    }
 
     // Handle incoming connections
     let mut incoming = listener.incoming();
@@ -134,6 +141,15 @@ async fn active_health_check_upstream(
         Some(())
     } else {
         None
+    }
+}
+
+async fn reset_counters(state: Arc<ProxyState>) {
+    let mut interval = time::interval(Duration::from_secs(60));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        state.requests_counters.write().await.clear();
     }
 }
 
@@ -195,6 +211,21 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
 async fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
+
+    if state.max_requests_per_minute != 0
+        && *state
+            .requests_counters
+            .write()
+            .await
+            .entry(client_ip.clone())
+            .and_modify(|counts| *counts += 1)
+            .or_insert(1)
+            > state.max_requests_per_minute
+    {
+        let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+        send_response(&mut client_conn, &response).await;
+        return;
+    }
 
     // Open a connection to a random destination server
     let mut upstream_conn = match connect_to_upstream(state).await {
